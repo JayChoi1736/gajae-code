@@ -47,22 +47,22 @@ describe("planTasks command shape (issue #622)", () => {
 
 describe("dev-ci canonical-plan workflow contract", () => {
 	test("pins independent no-shard and multi-shard detached-document byte oracles", () => {
-		const noShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"pr\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"skipped\",\"shards\":\"skipped\",\"windowsDoctor\":\"skipped\",\"windowsDoctorRequired\":\"false\",\"hasNative\":\"false\",\"hasTasks\":\"false\"},\"taskIdentities\":[],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}\n";
-		const multiShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"push\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"success\",\"shards\":\"success\",\"windowsDoctor\":\"success\",\"windowsDoctorRequired\":\"true\",\"hasNative\":\"true\",\"hasTasks\":\"true\"},\"taskIdentities\":[{\"key\":\"one\",\"identity\":\"id-one\"},{\"key\":\"two\",\"identity\":\"id-two\"}],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"name\":\".ci-dev-shard-receipts/0.json\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},{\"name\":\".ci-dev-shard-receipts/1.json\",\"sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}\n";
-		const noShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"588c6fef9fe2fd488a5f511c7e02e620c6c55a165d10997fa2d9aad24f5db746\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
-		const multiShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"276923dd0acb537de815b14eab377a2740224a4063679738cfd3bbae87324ba6\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
+		const noShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"pr\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"skipped\",\"shards\":\"skipped\",\"python\":\"skipped\",\"windowsDoctor\":\"skipped\",\"windowsDoctorRequired\":\"false\",\"hasNative\":\"false\",\"hasTasks\":\"false\",\"hasPython\":\"false\"},\"taskIdentities\":[],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}\n";
+		const multiShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"push\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"success\",\"shards\":\"success\",\"python\":\"success\",\"windowsDoctor\":\"success\",\"windowsDoctorRequired\":\"true\",\"hasNative\":\"true\",\"hasTasks\":\"true\",\"hasPython\":\"true\"},\"taskIdentities\":[{\"key\":\"one\",\"identity\":\"id-one\"},{\"key\":\"two\",\"identity\":\"id-two\"}],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"name\":\".ci-dev-shard-receipts/0.json\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},{\"name\":\".ci-dev-shard-receipts/1.json\",\"sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}\n";
+		const noShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"67bf70ed33b0f7da89b626a4aa5d9b301f69243ca932d981d64f11e1f9d98270\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
+		const multiShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"8a142fa5e7511c0731c9cd03299273e6ed15ac8440b0c81b025e1e40c29f5f5b\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
 		const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
-		expect(hash(noShardManifest)).toBe("588c6fef9fe2fd488a5f511c7e02e620c6c55a165d10997fa2d9aad24f5db746");
-		expect(hash(multiShardManifest)).toBe("276923dd0acb537de815b14eab377a2740224a4063679738cfd3bbae87324ba6");
-		expect(hash(noShardReceipt)).toBe("39f209e20824bec9839b6e9ffa8ce6a5f894b4190e80061c1635c46a645faa56");
-		expect(hash(multiShardReceipt)).toBe("0d939ebfb8e87300b3c8433e2a7e4499072f89f28fee1b3b164156b554d08eda");
+		expect(hash(noShardManifest)).toBe("67bf70ed33b0f7da89b626a4aa5d9b301f69243ca932d981d64f11e1f9d98270");
+		expect(hash(multiShardManifest)).toBe("8a142fa5e7511c0731c9cd03299273e6ed15ac8440b0c81b025e1e40c29f5f5b");
+		expect(hash(noShardReceipt)).toBe("d47023f480823422f39f0b224b2f6b318d8b6748ebc3ca18d88ac7dbd301b7e7");
+		expect(hash(multiShardReceipt)).toBe("888528524c10e2bd6148fa68720e263587632440bb6ff3b3bcbd58c544e09309");
 	});
 	test("uses a detached finalized evidence producer and artifact-ID consumer", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
 		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() }}");
-		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, windows-dev-doctor]");
+		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, windows-dev-doctor]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
 		expect(workflow).toContain("artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}");
@@ -142,10 +142,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			plan: "success",
 			native: "skipped",
 			shards: "skipped",
+			python: "skipped",
 			windowsDoctor: "skipped",
 			windowsDoctorRequired: "false",
 			hasNative: "false",
 			hasTasks: "false",
+			hasPython: "false",
 			darwinArm64TabWorkerSmoke: "skipped",
 			darwinArm64TabWorkerSmokeRequired: "false",
 		};
@@ -161,6 +163,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 				CI_DEV_SOURCE_SHA: sourceSha, CI_DEV_PLAN_DIGEST: digest, CI_DEV_PLAN_MODE: "pr", GITHUB_REPOSITORY: "owner/repo", GITHUB_WORKFLOW: "Dev CI", GITHUB_RUN_ID: "42",
 				CI_DEV_PLAN_RESULT: baseAggregate.plan, CI_DEV_NATIVE_RESULT: baseAggregate.native, CI_DEV_SHARDS_RESULT: baseAggregate.shards, CI_DEV_WINDOWS_DOCTOR_RESULT: baseAggregate.windowsDoctor,
 				CI_DEV_WINDOWS_DOCTOR_REQUIRED: baseAggregate.windowsDoctorRequired, CI_DEV_HAS_NATIVE: baseAggregate.hasNative, CI_DEV_HAS_TASKS: baseAggregate.hasTasks,
+				CI_DEV_PYTHON_RESULT: baseAggregate.python, CI_DEV_HAS_PYTHON: baseAggregate.hasPython,
 				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: baseAggregate.darwinArm64TabWorkerSmoke,
 				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: baseAggregate.darwinArm64TabWorkerSmokeRequired,
 			};
@@ -274,6 +277,8 @@ describe("dev-ci canonical-plan workflow contract", () => {
 					expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
 					await fs.writeFile(manifestPath, originalManifest); await fs.writeFile(receiptPath, originalReceipt);
 				}
+				await resign(manifest => { delete (manifest.aggregateResults as Record<string, string>).hasPython; });
+				await resign(manifest => { delete (manifest.aggregateResults as Record<string, string>).python; });
 				await resign(manifest => { (manifest.replayScope as Record<string, string>).runId = "stale"; });
 				await resign(manifest => { manifest.sourceSha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"; });
 				await resign(manifest => { (manifest.aggregateResults as Record<string, string>).plan = "failure"; });
@@ -340,10 +345,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
 		const valid: AffectedAggregateResults[] = [
-			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true", darwinArm64TabWorkerSmoke: "success", darwinArm64TabWorkerSmokeRequired: "true" },
-			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
-			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
-			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "success", shards: "success", python: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true", hasPython: "true", darwinArm64TabWorkerSmoke: "success", darwinArm64TabWorkerSmokeRequired: "true" },
+			{ plan: "success", native: "skipped", shards: "skipped", python: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false", hasPython: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "success", shards: "skipped", python: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false", hasPython: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "skipped", shards: "success", python: "skipped", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true", hasPython: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
 		];
 		for (const results of valid) expect(() => validateAffectedAggregate(results)).not.toThrow();
 
@@ -369,6 +374,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[1]!, windowsDoctorRequired: "maybe" },
 			{ ...valid[1]!, hasNative: "" },
 			{ ...valid[1]!, hasTasks: "maybe" },
+			{ ...valid[1]!, hasPython: "maybe" },
+			{ ...valid[0]!, python: "skipped" },
+			{ ...valid[1]!, python: "success" },
 			{ ...valid[1]!, native: "success" },
 			{ ...valid[1]!, shards: "success" },
 		]) expect(() => validateAffectedAggregate(results)).toThrow();
@@ -586,6 +594,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 
 		const output = await Bun.file(outputFile).text();
 		expect(output).toContain("has_tasks=true");
+		expect(output).toContain("has_python=false");
 		expect(output).toContain("has_native=true");
 		expect(output).toContain("changed_paths<<");
 
@@ -596,6 +605,18 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(matrix.include.some((shard: { key: string }) => shard.key.startsWith("cargo-build:"))).toBe(true);
 		// Native build tasks never appear as shards.
 		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
+	});
+	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const { stdout, exitCode } = await runScript(["--matrix-json"], "", { CI_FORCE_FULL: "1", GITHUB_OUTPUT: outputFile });
+		expect(exitCode).toBe(0);
+		expect((JSON.parse(stdout.trim()) as Array<{ key: string }>).filter(entry => entry.key.startsWith("python-"))).toHaveLength(3);
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain("has_python=true");
+		const matrix = JSON.parse((output.split("\n").find(line => line.startsWith("matrix=")) ?? "matrix={}").slice("matrix=".length));
+		expect(matrix.include.some((entry: { key: string }) => entry.key.startsWith("python-"))).toBe(false);
 	});
 
 	test("changed-path ranges use the canonical source head instead of ambient PR merge SHA", async () => {
@@ -1124,6 +1145,16 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("docs/changelog-only changes plan nothing expensive", () => {
 		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
 	});
+
+test("Python SDK changes plan dedicated Python validation and one native build", () => {
+	const changed = ["python/gjc-sdk/gjc_sdk/client.py"];
+	for (const tasks of [planTasks(changed, packages), planTargetedTasks(changed, packages, [])]) {
+		expect(tasks.map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke", "native-linux-x64"]);
+		expect(tasks.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
+	}
+	const full = planFullTasks(packages);
+	expect(full.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
+});
 
 
 	test("native-consuming test files pull in a single native build task", () => {
