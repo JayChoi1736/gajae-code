@@ -33,6 +33,7 @@ import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
 	type WorkflowGateEmitter,
@@ -40,6 +41,7 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
+import type { AgentSessionEvent } from "../../session/agent-session";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -918,6 +920,8 @@ interface SessionRuntime {
 					error: { code: string; message: string };
 			  },
 	) => void;
+	/** Publishes one canonical agent-wire event to the client that owns the active prompt. */
+	emitPromptEvent: (event: AgentSessionEvent) => void;
 	/** Inbound Telegram update ids injected but not yet consumed by a turn. */
 	pendingInbound: Set<number>;
 	/** Latest assistant text of the in-flight turn (from message_update). */
@@ -995,6 +999,7 @@ type SessionStartResult = {
 	status: SessionStartStatus;
 	runtime?: SessionRuntime;
 	failure?: SdkStartupFailure;
+	suppressExtensionError?: boolean;
 };
 
 function pushSessionFrame(
@@ -1921,8 +1926,10 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = (text: string) => {
-		api.sendUserMessage(text, { deliverAs: "steer" });
+	const sendSteer = async (text: string) => {
+		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
+		// control error instead of a false `accepted: true`.
+		await api.sendUserMessage(text, { deliverAs: "steer" });
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
@@ -2737,6 +2744,22 @@ function sdkInboundFrame(commandJson: string | undefined): Record<string, unknow
 		return undefined;
 	}
 }
+/**
+ * Ensures every configured chat-provider daemon is ready before the SDK
+ * publishes session identity. A rejected ensure is startup-fatal: presenting
+ * an identity for a transport that never became available is false success.
+ */
+export async function ensureConfiguredProviderDaemons(
+	settings: Settings,
+	cfg: NotificationConfig,
+	ensureProviderDaemon: (provider: "discord" | "slack", settings: Settings) => Promise<unknown> = (
+		provider,
+		configuredSettings,
+	) => (provider === "discord" ? ensureDiscordDaemon(configuredSettings) : ensureSlackDaemon(configuredSettings)),
+): Promise<void> {
+	if (isDiscordConfigured(cfg)) await ensureProviderDaemon("discord", settings);
+	if (isSlackConfigured(cfg)) await ensureProviderDaemon("slack", settings);
+}
 
 export function createNotificationsExtension(
 	api: ExtensionAPI,
@@ -2747,6 +2770,7 @@ export function createNotificationsExtension(
 			cwd: string;
 			sessionId: string;
 		}) => Promise<EnsureDaemonResult>;
+		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
 		controller?: NotificationSessionController;
@@ -2755,6 +2779,8 @@ export function createNotificationsExtension(
 
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+		/** Observes settlement of optional session-branch startup after reconciliation completes. */
+		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
 		readNotificationDiffStat?: (cwd: string) => Promise<string | undefined>;
 	} = {},
@@ -2772,9 +2798,12 @@ export function createNotificationsExtension(
 	// exact runtime object retains authority for an explicit idempotent retry.
 	const cleanupRetries = new Map<string, SessionRuntime>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
+	const branchStartupTasks = new Set<Promise<void>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
-	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+	let deferredIdentityRotation:
+		| { event: { previousSessionFile?: string }; ctx: ExtensionContext; awaitStartup: boolean }
+		| undefined;
 	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(
@@ -2791,7 +2820,7 @@ export function createNotificationsExtension(
 			? "blocked_identity"
 			: "ready";
 	}
-	async function ensureConfiguredDaemons(
+	async function ensureConfiguredDaemonOwners(
 		settings: Settings,
 		cfg: NotificationConfig,
 		cwd: string,
@@ -2800,8 +2829,7 @@ export function createNotificationsExtension(
 		if (isTelegramConfigured(cfg)) {
 			if ((await ensureTelegramOwner(settings, cwd, id)) === "blocked_identity") return false;
 		}
-		if (isDiscordConfigured(cfg)) await ensureDiscordDaemon(settings);
-		if (isSlackConfigured(cfg)) await ensureSlackDaemon(settings);
+		await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 		return true;
 	}
 	const identityControlOperations = new Set([
@@ -3116,7 +3144,7 @@ export function createNotificationsExtension(
 			error: unknown;
 			terminal: boolean;
 			createdAt: number;
-			bufferedLifecycle: PromptLifecycleFrame[];
+			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		const promptTerminalTombstones = new Map<string, number>();
@@ -3148,7 +3176,7 @@ export function createNotificationsExtension(
 		};
 		const abandonPrompt = (submission: PromptSubmission) => {
 			submission.abandoned = true;
-			submission.bufferedLifecycle.length = 0;
+			submission.bufferedFrames.length = 0;
 		};
 		const emitPromptLifecycle = (
 			correlation: { commandId: string; turnId: string } | undefined,
@@ -3168,7 +3196,7 @@ export function createNotificationsExtension(
 				return;
 			}
 			if (!submission.acknowledged) {
-				submission.bufferedLifecycle.push(frame);
+				submission.bufferedFrames.push(frame);
 				return;
 			}
 			try {
@@ -3179,8 +3207,31 @@ export function createNotificationsExtension(
 			}
 			if (submission.terminal) finalizePrompt(key, correlation);
 		};
+		const emitPromptEvent = (event: AgentSessionEvent) => {
+			if (!runtime?.activePromptCorrelation) return;
+			cleanupPromptRecords();
+			const correlation = runtime.activePromptCorrelation;
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission || submission.abandoned) return;
+			const frame = {
+				type: "event",
+				kind: event.type,
+				payload: toAgentWireEventPayload(event),
+				...correlation,
+			};
+			if (!submission.acknowledged) {
+				submission.bufferedFrames.push(frame);
+				return;
+			}
+			try {
+				runtime.server.sendTo(submission.connectionId, JSON.stringify(frame));
+			} catch (error) {
+				logger.warn(`sdk: correlated agent event delivery failed: ${String(error)}`);
+				abandonPrompt(submission);
+			}
+		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
-			for (const frame of submission.bufferedLifecycle.splice(0)) {
+			for (const frame of submission.bufferedFrames.splice(0)) {
 				try {
 					server.sendTo(submission.connectionId, JSON.stringify(frame));
 				} catch (error) {
@@ -3216,7 +3267,7 @@ export function createNotificationsExtension(
 				error: undefined,
 				terminal: false,
 				createdAt: Date.now(),
-				bufferedLifecycle: [],
+				bufferedFrames: [],
 			});
 		};
 		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
@@ -3390,7 +3441,8 @@ export function createNotificationsExtension(
 					const pending = deferredIdentityRotation;
 					deferredIdentityRotation = undefined;
 					identityControlInFlight = false;
-					if (response.ok === true && pending) await rotateSessionAuthority(pending.event, pending.ctx);
+					if (response.ok === true && pending)
+						await rotateSessionAuthority(pending.event, pending.ctx, pending.awaitStartup);
 				}
 			},
 			control: async (connectionId, frame) => {
@@ -3497,6 +3549,7 @@ export function createNotificationsExtension(
 			activePromptCorrelation: undefined,
 			recordPromptTerminal,
 			emitPromptLifecycle,
+			emitPromptEvent,
 			pendingInbound: new Set<number>(),
 			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
 			deferredGatePresentations: [],
@@ -3525,16 +3578,12 @@ export function createNotificationsExtension(
 		};
 		const cleanupAbandonedStartup = async (): Promise<void> => {
 			try {
-				await server.stopAndWait();
-			} catch {}
-			try {
-				await host.stop();
-				host.reverse.dispose();
-			} catch {}
-			try {
-				cursors.close();
-				await revisions.close();
-			} catch {}
+				await stopSession(id, "session", initializedRuntime);
+			} catch (error) {
+				// stopSession fences the exact runtime before releasing its owners and records
+				// the lifecycle rollback proof even when one release needs a later retry.
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
 		};
 
 		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {
@@ -3987,7 +4036,7 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (!(await ensureConfiguredDaemons(settings, cfg, ctx.cwd, id))) {
+					if (!(await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id))) {
 						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
 						finishStartup(result);
 						await cleanupAbandonedStartup();
@@ -4001,10 +4050,9 @@ export function createNotificationsExtension(
 				}
 			}
 
-			// Startup contract: identity is committed to the replayable SDK event log
-			// immediately after the host starts, before awaiting notification transport
-			// startup. Native frames are ephemeral, so ensure configured daemon owners
-			// before broadcasting identity; late SDK consumers still recover it from
+			// Startup contract: configured notification daemon ownership must be ready
+			// before identity or endpoint publication. Native frames are ephemeral, so
+			// publish identity only after readiness; late SDK consumers recover it from
 			// event_replay.
 			const identityHeader = {
 				type: "identity_header",
@@ -4220,6 +4268,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
+			let suppressExtensionError = false;
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);
@@ -4229,9 +4278,10 @@ export function createNotificationsExtension(
 				// than letting it escape startSession and surface a red extension error
 				// through session_start / session_switch / session_branch.
 				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+				suppressExtensionError = true;
 			}
 			if (!stopped) await cleanupAbandonedStartup();
-			return { ...result, runtime };
+			return { ...result, runtime, suppressExtensionError };
 		}
 	}
 
@@ -4369,22 +4419,93 @@ export function createNotificationsExtension(
 		},
 	});
 
+	const startAndReconcileSession = async (ctx: ExtensionContext): Promise<void> => {
+		const result = await startSession(ctx);
+		if (result.status === "started" || result.status === "already") {
+			await controller.reconcileCurrentSession(ctx);
+			return;
+		}
+		if (
+			!lifecycleStartupCapability &&
+			result.status === "failed" &&
+			!extensionShuttingDown &&
+			!result.suppressExtensionError
+		)
+			throw new Error(`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`);
+	};
+
 	api.on("session_start", async (_event, ctx) => {
-		await startSession(ctx);
-		await controller.reconcileCurrentSession(ctx);
+		await startAndReconcileSession(ctx);
 	});
 
 	// A session endpoint's token and generation are authority for exactly one
 	// session id. `/new`, fork, and resume must all tear down A before publishing
 	// B. Chat implementations may preserve a topic as metadata, but it must never
 	// preserve A's endpoint or credentials as B's control/viewing authority.
+	const reconcileBackgroundStartup = (
+		id: string,
+		ctx: ExtensionContext,
+		startup: Promise<SessionStartResult>,
+	): Promise<void> =>
+		startup
+			.then(async result => {
+				if (
+					result.status !== "started" ||
+					extensionShuttingDown ||
+					sessionId(ctx) !== id ||
+					activeRuntimeId !== id ||
+					!runtimes.has(id)
+				)
+					return;
+				await controller.reconcileCurrentSession(ctx);
+			})
+			.catch(error => logger.warn(`notifications: deferred startup reconciliation failed: ${String(error)}`));
+
+	const trackBranchStartup = (id: string, ctx: ExtensionContext, startup: Promise<SessionStartResult>): void => {
+		let status: SessionStartResult["status"] = "failed";
+		void startup.then(
+			result => {
+				status = result.status;
+			},
+			() => {},
+		);
+		const task = reconcileBackgroundStartup(id, ctx, startup);
+		branchStartupTasks.add(task);
+		void task.finally(() => {
+			branchStartupTasks.delete(task);
+			try {
+				options.onBranchStartupSettled?.({ sessionId: id, status });
+			} catch (error) {
+				logger.warn(`notifications: branch startup receipt failed: ${String(error)}`);
+			}
+		});
+	};
+
 	const rotateSessionAuthority = async (
 		event: { previousSessionFile?: string },
 		ctx: ExtensionContext,
+		awaitStartup: boolean,
 	): Promise<void> => {
 		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
 		const prevId = activeRuntimeId ?? sessionIdFromFile(event.previousSessionFile);
+		if (prevId === newId) {
+			const pendingStartup = sessionStartPromises.get(newId);
+			if (pendingStartup) {
+				if (awaitStartup) {
+					await pendingStartup;
+					if (!extensionShuttingDown && runtimes.has(newId) && activeRuntimeId === newId)
+						await controller.reconcileCurrentSession(ctx);
+				} else {
+					trackBranchStartup(newId, ctx, pendingStartup);
+				}
+				return;
+			}
+			if (runtimes.has(newId)) {
+				await controller.reconcileCurrentSession(ctx);
+				return;
+			}
+		}
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
 			try {
@@ -4398,26 +4519,35 @@ export function createNotificationsExtension(
 			}
 		}
 		if (extensionShuttingDown) return;
-		await startSession(ctx);
-		if (extensionShuttingDown) {
-			await stopSession(newId);
+		const startup = startSession(ctx);
+		if (awaitStartup) {
+			const result = await startup;
+			if (!lifecycleStartupCapability && result.status === "failed")
+				throw new Error(
+					`notifications: SDK startup failed: ${result.failure?.message ?? "Unknown startup failure."}`,
+				);
+			if (extensionShuttingDown) {
+				await stopSession(newId);
+				return;
+			}
+			await controller.reconcileCurrentSession(ctx);
 			return;
 		}
-		await controller.reconcileCurrentSession(ctx);
+		trackBranchStartup(newId, ctx, startup);
 	};
 	api.on("session_switch", async (event, ctx) => {
 		if (identityControlInFlight) {
-			deferredIdentityRotation = { event, ctx };
+			deferredIdentityRotation = { event, ctx, awaitStartup: true };
 			return;
 		}
-		await rotateSessionAuthority(event, ctx);
+		await rotateSessionAuthority(event, ctx, true);
 	});
 	api.on("session_branch", async (event, ctx) => {
 		if (identityControlInFlight) {
-			deferredIdentityRotation = { event, ctx };
+			deferredIdentityRotation = { event, ctx, awaitStartup: false };
 			return;
 		}
-		await rotateSessionAuthority(event, ctx);
+		await rotateSessionAuthority(event, ctx, false);
 	});
 
 	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
@@ -4757,6 +4887,7 @@ export function createNotificationsExtension(
 	api.on("message_update", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
+		rt?.emitPromptEvent(event);
 		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
 		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
@@ -4780,6 +4911,7 @@ export function createNotificationsExtension(
 	api.on("message_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
+		rt?.emitPromptEvent(event);
 		if (!rt?.notificationsActive || rt.redact) return;
 		// Capture the in-flight ASSISTANT text here (message_end is on the awaited
 		// extension path and ordered before tool_execution_start) so the pre-ask
@@ -4808,6 +4940,7 @@ export function createNotificationsExtension(
 		extensionShuttingDown = true;
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
+		await Promise.allSettled([...branchStartupTasks]);
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "unknown");

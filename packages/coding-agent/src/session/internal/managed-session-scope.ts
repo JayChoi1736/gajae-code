@@ -14,13 +14,16 @@ import {
 import {
 	acquireManagedLock,
 	captureManagedFileNoFollow,
+	captureManagedFilePrefixNoFollow,
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
+	ManagedSessionDescendantStore,
 	type ManagedStorageLock,
+	managedDirectoryRoot,
 	publishManagedFileNoReplace,
-	publishManagedFileNoReplaceSync,
 	publishManagedTombstone,
+	retainManagedDirectoryAuthority,
 	validateManagedArtifactTree,
 } from "./managed-session-storage";
 
@@ -39,6 +42,49 @@ export interface ManagedScope {
 	directoryName: string;
 	directoryPath: string;
 	platform: "posix" | "win32";
+}
+
+const managedRoots = new WeakMap<ManagedScope, ReturnType<typeof managedDirectoryRoot>>();
+const managedDirectoryIdentities = new WeakMap<ManagedScope, { dev: bigint; ino: bigint }>();
+const managedDirectoryAuthorities = new WeakMap<ManagedScope, native.RecoveryFsRoot | undefined>();
+
+export function managedDirectoryAuthorityForScope(scope: ManagedScope): native.RecoveryFsRoot | undefined {
+	if (!managedDirectoryAuthorities.has(scope)) throw new Error("Managed session directory authority was not prepared");
+	return managedDirectoryAuthorities.get(scope);
+}
+
+export function managedDirectoryIdentityForScope(scope: ManagedScope): { dev: bigint; ino: bigint } {
+	const identity = managedDirectoryIdentities.get(scope);
+	if (!identity) throw new Error("Managed session directory identity was not prepared");
+	return identity;
+}
+
+function configuredRootPath(scope: ManagedScope): string {
+	let candidate = pathIsWithin(scope.agentDir, scope.sessionsRoot) ? scope.agentDir : path.dirname(scope.sessionsRoot);
+	for (;;) {
+		try {
+			const stat = fs.lstatSync(candidate);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe configured root: ${candidate}`);
+			return fs.realpathSync.native(candidate);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const parent = path.dirname(candidate);
+			if (parent === candidate) throw new Error("Configured managed root is unavailable.");
+			candidate = parent;
+		}
+	}
+}
+
+function scopeRoot(scope: ManagedScope) {
+	const retained = managedRoots.get(scope);
+	if (retained) return retained;
+	const root = managedDirectoryRoot(configuredRootPath(scope));
+	managedRoots.set(scope, root);
+	return root;
+}
+
+export function managedRootForScope(scope: ManagedScope) {
+	return scopeRoot(scope);
 }
 
 export type ManagedMigrationPolicy = "copy-retain" | "disabled";
@@ -228,15 +274,11 @@ function isBinding(value: unknown): value is Binding {
 	);
 }
 
-function validateExistingBinding(scope: ManagedScope): ManagedScopeResolution | undefined {
-	const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
-	let raw: string;
+function validateBindingRaw(scope: ManagedScope, raw: string): ManagedScopeResolution | undefined {
 	let parsed: unknown;
 	try {
-		raw = captureManagedFileNoFollow(bindingPath).bytes.toString("utf8");
 		parsed = JSON.parse(raw);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+	} catch {
 		return { kind: "error", code: "binding_invalid", message: "The managed scope binding is invalid JSON." };
 	}
 	if (!isBinding(parsed))
@@ -263,6 +305,18 @@ function validateExistingBinding(scope: ManagedScope): ManagedScopeResolution | 
 	return undefined;
 }
 
+function validateExistingBinding(scope: ManagedScope): ManagedScopeResolution | undefined {
+	const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
+	let raw: string;
+	try {
+		raw = captureManagedFileNoFollow(bindingPath).bytes.toString("utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		return { kind: "error", code: "binding_invalid", message: "The managed scope binding is invalid JSON." };
+	}
+	return validateBindingRaw(scope, raw);
+}
+
 export function resolveManagedScope(input: {
 	cwd: string;
 	agentDir: string;
@@ -270,6 +324,23 @@ export function resolveManagedScope(input: {
 }): ManagedScopeResolution {
 	const identity = identityFor(input.cwd);
 	if (!identity.ok) return nativeFailure(identity.code);
+	try {
+		if (fs.lstatSync(input.sessionsRoot).isSymbolicLink()) {
+			return {
+				kind: "error",
+				code: "sessions_root_unavailable",
+				message: "The sessions root is not a safe directory.",
+			};
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			return {
+				kind: "error",
+				code: "sessions_root_unavailable",
+				message: "The sessions root could not be inspected.",
+			};
+		}
+	}
 	const sessionsRoot = canonicalizeTrustedPath(input.sessionsRoot);
 	const agentDir = canonicalizeTrustedPath(input.agentDir);
 	const digest = scopeDigest(identity.platform, identity.canonicalPath);
@@ -390,6 +461,49 @@ function fsyncManagedParent(pathname: string): void {
 	}
 }
 
+type CandidatePreflight =
+	| { kind: "capture"; identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint } }
+	| {
+			kind: "foreign";
+	  }
+	| {
+			kind: "invalid";
+			code: string;
+	  };
+
+function preflightCandidate(filePath: string, scope: ManagedScope): CandidatePreflight {
+	try {
+		const snapshot = captureManagedFilePrefixNoFollow(filePath, HEADER_MAX_BYTES);
+		const lineEnd = snapshot.bytes.indexOf(0x0a);
+		if (lineEnd < 0) return { kind: "invalid", code: "invalid_header" };
+		const value: unknown = JSON.parse(snapshot.bytes.subarray(0, lineEnd).toString("utf8"));
+		if (!value || typeof value !== "object" || Array.isArray(value))
+			return { kind: "invalid", code: "invalid_header" };
+		const header = value as Record<string, unknown>;
+		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
+			return { kind: "invalid", code: "invalid_header" };
+		const candidateIdentity = identityFor(header.cwd);
+		if (
+			candidateIdentity.ok &&
+			(candidateIdentity.platform !== scope.platform || candidateIdentity.canonicalPath !== scope.canonicalCwd)
+		)
+			return { kind: "foreign" };
+		return { kind: "capture", identity: snapshot.identity };
+	} catch {
+		return { kind: "invalid", code: "unreadable_candidate" };
+	}
+}
+
+function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: CandidatePreflight): boolean {
+	return (
+		preflight.kind === "capture" &&
+		candidate.identity.dev === preflight.identity.dev &&
+		candidate.identity.ino === preflight.identity.ino &&
+		candidate.identity.size === preflight.identity.size &&
+		candidate.identity.mtimeNs === preflight.identity.mtimeNs
+	);
+}
+
 function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): ManagedCandidate | { code: string } {
 	try {
 		const snapshot = captureManagedFileNoFollow(filePath);
@@ -400,7 +514,8 @@ function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): Manage
 		const header = value as Record<string, unknown>;
 		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
 			return { code: "invalid_header" };
-		if (!identityFor(header.cwd).ok) return { code: "invalid_cwd" };
+		const cwdIdentity = identityFor(header.cwd);
+		if (!cwdIdentity.ok) return { code: `cwd_${cwdIdentity.code}` };
 		const named = fs.lstatSync(filePath, { bigint: true });
 		if (
 			!named.isFile() ||
@@ -450,10 +565,13 @@ function discoveredLegacyDirectoryNames(scope: ManagedScope): readonly string[] 
 	return [...known, ...discovered];
 }
 
+type CandidateInspection = ManagedCandidate | { code: string } | { foreign: true };
+
 function listDirectoryCandidates(
 	directory: string,
 	provenance: "v2" | "legacy",
-): readonly (ManagedCandidate | { code: string })[] {
+	scope: ManagedScope,
+): readonly CandidateInspection[] {
 	let directoryStat: fs.Stats;
 	try {
 		directoryStat = fs.lstatSync(directory);
@@ -465,17 +583,26 @@ function listDirectoryCandidates(
 	return fs
 		.readdirSync(directory, { withFileTypes: true })
 		.filter(entry => entry.name.endsWith(".jsonl"))
-		.map(entry => inspectCandidate(path.join(directory, entry.name), provenance));
+		.map(entry => {
+			const filePath = path.join(directory, entry.name);
+			const preflight = preflightCandidate(filePath, scope);
+			if (preflight.kind === "invalid") return { code: preflight.code };
+			if (preflight.kind === "foreign") return { foreign: true };
+			const candidate = inspectCandidate(filePath, provenance);
+			if ("code" in candidate) return candidate;
+			return matchesPreflightIdentity(candidate, preflight) ? candidate : { code: "source_changed" };
+		});
 }
 
 export async function ensureManagedScope(scope: ManagedScope): Promise<ManagedScopeResolution> {
 	try {
-		ensureManagedDirectory(scope.sessionsRoot);
-		ensureManagedDirectory(scope.directoryPath);
+		const root = scopeRoot(scope);
+		ensureManagedDirectory(scope.sessionsRoot, root);
+		ensureManagedDirectory(scope.directoryPath, root);
 		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
 		const binding = `${JSON.stringify(bindingFor(scope))}\n`;
 		try {
-			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding));
+			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
@@ -489,27 +616,120 @@ export async function ensureManagedScope(scope: ManagedScope): Promise<ManagedSc
 	}
 }
 
+/**
+ * Re-apply owner-only security to every descendant of a managed scope directory.
+ *
+ * A managed scope can accumulate group/other-readable descendants when a
+ * different code path writes into it without the secured managed-storage
+ * helpers — notably the resident-cache `EphemeralBlobStore` created on the
+ * explicit session path. The managed-tree snapshot fails closed on the first
+ * such descendant (`mode_mismatch`), which would otherwise abort launch with an
+ * uncaught exception. Re-securing the tree in place lets a drifted scope
+ * recover on the next launch instead of trapping the user behind a fatal error.
+ */
+function reapplyOwnerOnlyManagedTree(directory: string): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(directory, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const child = path.join(directory, entry.name);
+		let stat: fs.Stats;
+		try {
+			stat = fs.lstatSync(child);
+		} catch {
+			continue;
+		}
+		if (stat.isSymbolicLink()) continue;
+		if (stat.isDirectory()) {
+			reapplyOwnerOnlyManagedTree(child);
+			try {
+				native.applyOwnerOnlyPathSecurity(child, "directory");
+			} catch {
+				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
+			}
+		} else if (stat.isFile()) {
+			try {
+				native.applyOwnerOnlyPathSecurity(child, "file");
+			} catch {
+				// Best-effort, as above.
+			}
+		}
+	}
+	try {
+		native.applyOwnerOnlyPathSecurity(directory, "directory");
+	} catch {
+		// Best-effort, as above.
+	}
+}
+
+/**
+ * True when a managed setup error reflects a fixable owner-only *mode* drift
+ * (group/other permission bits) rather than an ownership or identity change.
+ * Only mode drift can be self-healed by re-applying owner-only permissions.
+ */
+function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : "";
+	return message === "mode_mismatch" || message.endsWith(": mode_mismatch");
+}
+
 /** Synchronously create and validate the v2 binding before a default session writer exists. */
 export function prepareManagedSessionScopeForWriteSync(scope: ManagedScope): ManagedScopeResolution {
 	try {
-		ensureManagedDirectory(scope.sessionsRoot);
-		ensureManagedDirectory(scope.directoryPath);
-		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
-		try {
-			publishManagedFileNoReplaceSync(
-				bindingPath,
-				new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`),
+		const root = scopeRoot(scope);
+		ensureManagedDirectory(scope.sessionsRoot, root);
+		ensureManagedDirectory(scope.directoryPath, root);
+		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
+		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
+			throw new Error("Managed session directory changed");
+		const retainedAuthority = retainManagedDirectoryAuthority(root, scope.directoryPath, {
+			dev: preparedDirectory.dev,
+			ino: preparedDirectory.ino,
+		});
+		const buildStore = () =>
+			new ManagedSessionDescendantStore(
+				root,
+				scope.directoryPath,
+				retainedAuthority ? { authority: retainedAuthority, authorityBaseDir: scope.directoryPath } : undefined,
 			);
+		let store: ManagedSessionDescendantStore;
+		try {
+			store = buildStore();
+		} catch (error) {
+			if (!isRecoverableOwnerOnlyModeDrift(error)) throw error;
+			// A prior writer left group/other-readable descendants under the scope
+			// (e.g. resident-cache blobs written on the explicit session path).
+			// Re-secure the tree in place and retry once before failing closed.
+			reapplyOwnerOnlyManagedTree(scope.directoryPath);
+			store = buildStore();
+		}
+		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
+		try {
+			store.publishNoReplaceSync(MANAGED_SESSION_BINDING_FILE, binding);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
-		const validated = validateExistingBinding(scope);
+		const capturedBinding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
+		if (!capturedBinding) throw new Error("Managed scope binding is unavailable");
+		const validated = validateBindingRaw(scope, capturedBinding.bytes.toString("utf8"));
+		managedDirectoryAuthorities.set(scope, retainedAuthority);
+		const directoryStat = fs.lstatSync(scope.directoryPath, { bigint: true });
+		if (
+			!directoryStat.isDirectory() ||
+			directoryStat.isSymbolicLink() ||
+			directoryStat.dev !== preparedDirectory.dev ||
+			directoryStat.ino !== preparedDirectory.ino
+		)
+			throw new Error("Managed session directory changed");
+		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
 		if (validated) return validated;
 		const internal = managedInternalDirectory(scope);
-		ensureManagedDirectory(internal);
-		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY));
-		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY));
-		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY));
+		ensureManagedDirectory(internal, root);
+		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root);
+		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root);
+		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		return {
@@ -544,14 +764,18 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		];
 		const seen = new Set<string>();
 		for (const directory of directories) {
-			for (const candidate of listDirectoryCandidates(directory.path, directory.provenance)) {
+			for (const candidate of listDirectoryCandidates(directory.path, directory.provenance, scope)) {
 				if ("code" in candidate) {
 					invalid.push({ code: candidate.code });
 					continue;
 				}
+				if ("foreign" in candidate) {
+					foreignCount++;
+					continue;
+				}
 				const candidateIdentity = identityFor(candidate.cwd);
 				if (!candidateIdentity.ok) {
-					invalid.push({ code: "invalid_cwd" });
+					invalid.push({ code: `cwd_${candidateIdentity.code}` });
 					continue;
 				}
 				if (
@@ -1088,6 +1312,7 @@ function artifactTreeSnapshot(value: unknown): NativeDirectoryTreeSnapshot | und
 				typeof item.ino === "string" &&
 				typeof item.size === "string" &&
 				typeof item.mtimeNs === "string" &&
+				typeof item.ctimeNs === "string" &&
 				(item.sha256 === undefined || typeof item.sha256 === "string")
 			);
 		})
@@ -1626,12 +1851,14 @@ function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot): void {
 }
 
 async function copyArtifacts(
+	scope: ManagedScope,
 	sourceTranscript: string,
 	destinationTranscript: string,
 	manifest: readonly ArtifactManifestEntry[],
 	lock: ManagedStorageLock,
 	sourceRootOverride?: string,
 ): Promise<void> {
+	const root = scopeRoot(scope);
 	if (manifest.length === 0) return;
 	const sourceRoot = sourceRootOverride ?? sourceTranscript.slice(0, -6);
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot)) throw new Error("source_changed");
@@ -1641,8 +1868,8 @@ async function copyArtifacts(
 		const source = path.join(sourceRoot, entry.path);
 		const destination = path.join(destinationRoot, entry.path);
 		if (entry.kind === "directory") {
-			if (entry.path === "") ensureManagedDirectory(destinationRoot);
-			else ensureManagedDirectory(destination);
+			if (entry.path === "") ensureManagedDirectory(destinationRoot, root);
+			else ensureManagedDirectory(destination, root);
 			continue;
 		}
 		const snapshot = captureManagedFileNoFollow(source);
@@ -1652,7 +1879,7 @@ async function copyArtifacts(
 		)
 			throw new Error("source_changed");
 		try {
-			await copyManagedFileNoReplace(source, destination, snapshot);
+			await copyManagedFileNoReplace(source, destination, snapshot, root);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
@@ -1769,6 +1996,7 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 			lock = await acquireManagedLock(
 				path.join(managedInternalDirectory(scope), MANAGED_LOCKS_DIRECTORY),
 				path.basename(tombstone, ".json"),
+				scopeRoot(scope),
 			);
 			const lockedTargets = retiredTargets(scope, tombstone);
 			if (!lockedTargets) continue;
@@ -1880,10 +2108,11 @@ export async function prepareManagedSessionScopeForWrite(scope: ManagedScope): P
 	if (prepared.kind === "error") return prepared;
 	try {
 		const internal = managedInternalDirectory(scope);
-		ensureManagedDirectory(internal);
-		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY));
-		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY));
-		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY));
+		const root = scopeRoot(scope);
+		ensureManagedDirectory(internal, root);
+		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root);
+		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root);
+		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root);
 		await reconcileManagedTombstones(scope);
 		return { kind: "resolved", scope };
 	} catch (error) {
@@ -1934,7 +2163,7 @@ export async function openManagedCandidateForWrite(
 	let lock: ManagedStorageLock | undefined;
 	let detachedArtifacts: DetachedArtifactRoot | undefined;
 	try {
-		lock = await acquireManagedLock(path.join(internal, MANAGED_LOCKS_DIRECTORY), operation);
+		lock = await acquireManagedLock(path.join(internal, MANAGED_LOCKS_DIRECTORY), operation, scopeRoot(scope));
 		const afterLock = validateCandidateForScope(scope, current);
 		if (!afterLock)
 			return { kind: "error", code: "source_changed", message: "The legacy candidate changed during migration." };
@@ -2000,11 +2229,11 @@ export async function openManagedCandidateForWrite(
 		if (artifactPlan && fs.existsSync(artifactPlan.detachedPath)) throw new Error("destination_conflict");
 		detachedArtifacts = artifactPlan ? detachArtifactRootForMigration(artifactPlan) : undefined;
 		manifest = detachedArtifacts ? artifactManifestFromSnapshot(detachedArtifacts.tree) : [];
-		await copyArtifacts(afterLock.path, destination, manifest, lock, detachedArtifacts?.detachedPath);
+		await copyArtifacts(scope, afterLock.path, destination, manifest, lock, detachedArtifacts?.detachedPath);
 		if (!existing) {
 			try {
 				lock.assertOwned();
-				await copyManagedFileNoReplace(afterLock.path, destination, sourceSnapshot);
+				await copyManagedFileNoReplace(afterLock.path, destination, sourceSnapshot, scopeRoot(scope));
 			} catch (error) {
 				if ((error as Error).message !== "destination_conflict") throw error;
 			}
@@ -2101,7 +2330,11 @@ export async function deleteManagedSessionCandidate(
 	const operation = path.basename(tombstone, ".json");
 	let lock: ManagedStorageLock | undefined;
 	try {
-		lock = await acquireManagedLock(path.join(managedInternalDirectory(scope), MANAGED_LOCKS_DIRECTORY), operation);
+		lock = await acquireManagedLock(
+			path.join(managedInternalDirectory(scope), MANAGED_LOCKS_DIRECTORY),
+			operation,
+			scopeRoot(scope),
+		);
 		let targets = retiredTargets(scope, tombstone);
 		if (!targets) {
 			if (!current) throw new Error("source_changed");

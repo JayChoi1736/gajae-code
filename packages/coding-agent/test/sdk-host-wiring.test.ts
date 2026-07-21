@@ -735,6 +735,42 @@ test("interactive extension context advertises typed SDK controls and forwards p
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
 
+test("interactive session.handoff SDK control threads focus instructions to session.handoff", async () => {
+	let contextActions: ExtensionContextActions | undefined;
+	const handoffCalls: (string | undefined)[] = [];
+	const runner = {
+		initialize(
+			_actions: ExtensionActions,
+			actions: ExtensionContextActions,
+			_commands: unknown,
+			_ui: ExtensionUIContext,
+		): void {
+			contextActions = actions;
+		},
+	};
+	const controller = new ExtensionUiController({
+		session: {
+			extensionRunner: runner,
+			handoff: async (instructions?: string) => {
+				handoffCalls.push(instructions);
+				return { document: "## Goal\nContinue", savedPath: undefined };
+			},
+		},
+	} as unknown as InteractiveModeContext);
+	controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+	// The wire carries the focus under `target` (see sdk-control-dispatch);
+	// the SDK control seam must forward it to session.handoff.
+	expect(await contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" })).toEqual({
+		handoff: { document: "## Goal\nContinue", savedPath: undefined },
+	});
+	expect(handoffCalls).toEqual(["preserve failing test"]);
+
+	// A bare handoff (no focus) forwards undefined.
+	await contextActions?.sdkControl?.("session.handoff", {});
+	expect(handoffCalls).toEqual(["preserve failing test", undefined]);
+});
+
 test("startup records identity before an early lifecycle event and publishes it only after NotificationServer starts", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-identity-startup-"));
 	dirs.push(cwd);
@@ -1323,6 +1359,14 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("message_update")?.(
+		{
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+			assistantMessageEvent: { type: "text_delta", delta: "hi" },
+		},
+		sessionContext,
+	);
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -1344,6 +1388,25 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		() => frames.some(frame => frame.type === "agent_start") && frames.some(frame => frame.type === "agent_end"),
 		"correlated accepted prompt lifecycle",
 	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "event" &&
+					frame.kind === "message_update" &&
+					(frame.payload as { event?: { assistantMessageEvent?: { delta?: unknown } } })?.event
+						?.assistantMessageEvent?.delta === "hi",
+			),
+		"correlated assistant message event",
+	);
+	observer.send(JSON.stringify({ type: "event_replay", id: "observer-replay", sinceSeq: 0 }));
+	await waitFor(
+		() => observerFrames.some(frame => frame.type === "event_replay_result" && frame.id === "observer-replay"),
+		"observer event replay",
+	);
+	const observerReplay = observerFrames.find(
+		frame => frame.type === "event_replay_result" && frame.id === "observer-replay",
+	) as { events?: Array<Record<string, unknown>> };
 	const correlation = {
 		commandId: acknowledgement.result?.commandId,
 		turnId: acknowledgement.result?.turnId,
@@ -1355,6 +1418,8 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 		expect.objectContaining({ type: "agent_end", sessionId, ...correlation }),
 	]);
 	expect(observerFrames.some(frame => frame.type === "agent_start" || frame.type === "agent_end")).toBe(false);
+	expect(observerFrames.some(frame => frame.type === "event" && frame.kind === "message_update")).toBe(false);
+	expect(observerReplay.events?.some(frame => frame.kind === "message_update")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 

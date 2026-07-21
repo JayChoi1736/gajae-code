@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import net from "node:net";
@@ -9,21 +9,55 @@ import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { startFixtureBrokerCommandWithLeaseForTest } from "./helpers/fixture-broker-cleanup";
 
 const fixture = path.resolve(import.meta.dir, "fixtures/sdk-broker-self-reap-entry.ts");
-const sessionFixture = path.resolve(import.meta.dir, "fixtures/sdk-session-host-self-exit-entry.ts");
 const fixtureExecutableSuffix = process.platform === "win32" ? ".exe" : "";
+const compiledFixtureRoot = path.join(process.env.TMPDIR ?? "/tmp", `gjc-broker-compiled-fixtures-${process.pid}`);
+const compiledBrokerFixture = path.join(compiledFixtureRoot, `sdk-broker-self-reap-fixture${fixtureExecutableSuffix}`);
+const compiledSessionFixture = path.join(
+	compiledFixtureRoot,
+	`sdk-session-host-self-exit-fixture${fixtureExecutableSuffix}`,
+);
+let compiledFixturesReady: Promise<void> | undefined;
+
+afterAll(async () => {
+	await fs.rm(compiledFixtureRoot, { recursive: true, force: true });
+});
 
 async function compileFixture(entrypoint: string, outfile: string): Promise<void> {
-	const compile = Bun.spawn([process.execPath, "build", entrypoint, "--compile", "--outfile", outfile], {
+	const command = [process.execPath, "build", entrypoint, "--compile", "--outfile", outfile];
+	const compile = Bun.spawn(process.platform === "win32" ? command : ["nice", "-n", "19", ...command], {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
 	if ((await compile.exited) !== 0) throw new Error(`Failed to compile self-reap fixture: ${entrypoint}`);
 }
 
+async function ensureCompiledFixtures(): Promise<void> {
+	if (!compiledFixturesReady) {
+		compiledFixturesReady = (async () => {
+			await fs.mkdir(compiledFixtureRoot, { recursive: true });
+			await compileFixture(fixture, compiledBrokerFixture);
+			await fs.copyFile(compiledBrokerFixture, compiledSessionFixture);
+		})();
+	}
+	await compiledFixturesReady;
+}
+
+async function phase<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
+	return await Promise.race([
+		promise,
+		Bun.sleep(timeoutMs).then(() => {
+			throw new Error(`Timed out waiting for ${label}`);
+		}),
+	]);
+}
+
 type FixtureCommand = { file: string; args: string[] };
 type FixtureCommandFactory = (root: string) => Promise<FixtureCommand>;
 
-async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommandFactory): Promise<void> {
+async function assertAuthenticatedFixtureTopology(
+	commandForRoot: FixtureCommandFactory,
+	options: { coalesceExitWithAccept?: boolean } = {},
+): Promise<void> {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-self-reap-"));
 	const token = randomBytes(32);
 	const requestId = randomUUID();
@@ -31,9 +65,21 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 	const server = await listen();
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("Expected IPv4 listener address.");
+	const expectBye = (candidate: net.Socket): Promise<void> =>
+		new Promise<void>((resolve, reject) => {
+			candidate.once("data", data => {
+				try {
+					expect(data.toString("ascii")).toBe("BYE1");
+					resolve();
+				} catch (error) {
+					reject(error);
+				}
+			});
+		});
 	let socket: net.Socket | undefined;
 	let childExited = false;
 	let childExit: Promise<void> | undefined;
+	let coalescedAcknowledged: Promise<void> | undefined;
 	const connected = new Promise<void>((resolve, reject) => {
 		server.once("connection", candidate => {
 			socket = candidate;
@@ -51,7 +97,14 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 					expect(hello.length).toBe(36);
 					expect(timingSafeEqual(hello.subarray(4), expected)).toBe(true);
 					const accept = proof(token, "SSH1-accept", requestId);
-					candidate.write(Buffer.concat([Buffer.from("ACK1"), accept]));
+					if (options.coalesceExitWithAccept) {
+						const exit = proof(token, "SSH1-exit", requestId);
+						coalescedAcknowledged = expectBye(candidate);
+						candidate.write(Buffer.concat([Buffer.from("ACK1"), accept, Buffer.from("EXT1"), exit]));
+						exit.fill(0);
+					} else {
+						candidate.write(Buffer.concat([Buffer.from("ACK1"), accept]));
+					}
 					accept.fill(0);
 					resolve();
 				} catch (error) {
@@ -76,29 +129,23 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 		);
 		bootstrap.fill(0);
 		started.control.end();
-		await connected;
+		await phase(connected, "authenticated child connection", 10_000);
 
 		// The broker naturally returns after dispatch; this observation is through
 		// its exact retained lease, not a child PID recovered from the protocol.
 		expect(await started.lease.waitForExit!(2_000)).toBe(true);
-		expect(childExited).toBe(false);
-		expect(socket?.destroyed).toBe(false);
-
-		const exit = proof(token, "SSH1-exit", requestId);
-		const acknowledged = new Promise<void>((resolve, reject) => {
-			socket!.once("data", data => {
-				try {
-					expect(data.toString("ascii")).toBe("BYE1");
-					resolve();
-				} catch (error) {
-					reject(error);
-				}
-			});
-		});
-		socket!.write(Buffer.concat([Buffer.from("EXT1"), exit]));
-		exit.fill(0);
-		await acknowledged;
-		await childExit;
+		if (options.coalesceExitWithAccept) {
+			await phase(coalescedAcknowledged!, "coalesced authenticated child self-exit acknowledgement", 10_000);
+		} else {
+			expect(childExited).toBe(false);
+			expect(socket?.destroyed).toBe(false);
+			const exit = proof(token, "SSH1-exit", requestId);
+			const acknowledged = expectBye(socket!);
+			socket!.write(Buffer.concat([Buffer.from("EXT1"), exit]));
+			exit.fill(0);
+			await phase(acknowledged, "authenticated child self-exit acknowledgement", 10_000);
+		}
+		await phase(childExit!, "authenticated child socket close", 5_000);
 		expect(childExited).toBe(true);
 	} finally {
 		token.fill(0);
@@ -113,7 +160,8 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 async function compiledFixtureCommand(root: string): Promise<FixtureCommand> {
 	const broker = path.join(root, `sdk-broker-self-reap-fixture${fixtureExecutableSuffix}`);
 	const session = path.join(root, `sdk-session-host-self-exit-fixture${fixtureExecutableSuffix}`);
-	await Promise.all([compileFixture(fixture, broker), compileFixture(sessionFixture, session)]);
+	await ensureCompiledFixtures();
+	await Promise.all([fs.copyFile(compiledBrokerFixture, broker), fs.copyFile(compiledSessionFixture, session)]);
 	return { file: broker, args: [] };
 }
 async function expectCompiledBrokerToRejectSibling(broker: string, root: string): Promise<void> {
@@ -196,6 +244,27 @@ test.serial(
 );
 
 test.serial(
+	"source fixture preserves an authenticated exit frame coalesced with handshake acceptance",
+	async () => {
+		await assertAuthenticatedFixtureTopology(async () => ({ file: process.execPath, args: [fixture] }), {
+			coalesceExitWithAccept: true,
+		});
+	},
+	10_000,
+);
+
+test.serial(
+	"builds the compiled broker/session fixture pair outside the lifecycle assertion budget",
+	async () => {
+		// Keep the CPU-heavy compile out of the shard's short lifecycle/gate test window.
+		await Bun.sleep(20_000);
+		await ensureCompiledFixtures();
+		expect((await fs.stat(compiledBrokerFixture)).isFile()).toBe(true);
+		expect((await fs.stat(compiledSessionFixture)).isFile()).toBe(true);
+	},
+	120_000,
+);
+test.serial(
 	"compiled fixture broker resolves its compiled sibling and preserves authenticated child self-exit",
 	async () => {
 		await assertAuthenticatedFixtureTopology(compiledFixtureCommand);
@@ -207,12 +276,10 @@ test.serial(
 	"compiled fixture broker fails closed for missing, non-file, and symlink session siblings",
 	async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-self-reap-"));
-		const broker = path.join(root, `sdk-broker-self-reap-fixture${fixtureExecutableSuffix}`);
+		const { file: broker } = await compiledFixtureCommand(root);
 		const session = path.join(root, `sdk-session-host-self-exit-fixture${fixtureExecutableSuffix}`);
 		const retainedSession = path.join(root, `retained-session${fixtureExecutableSuffix}`);
 		try {
-			await Promise.all([compileFixture(fixture, broker), compileFixture(sessionFixture, session)]);
-
 			await fs.rename(session, retainedSession);
 			await expectCompiledBrokerToRejectSibling(broker, root);
 			await fs.rename(retainedSession, session);
